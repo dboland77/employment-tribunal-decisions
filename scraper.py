@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Employment Tribunal Decisions Scraper
+Employment Tribunal / Employment Appeal Tribunal Decisions Scraper
 
 Commands:
   sync          Fetch all decision slugs from GOV.UK into the local DB index
@@ -28,6 +28,20 @@ CONTENT_API = f"{BASE_URL}/api/content"
 PAGE_SIZE = 1000
 DB_PATH = Path("decisions.db")
 
+# Supported tribunal types
+TRIBUNALS = {
+    "et": {
+        "document_type": "employment_tribunal_decision",
+        "slug_prefix": "/employment-tribunal-decisions",
+        "label": "Employment Tribunal",
+    },
+    "eat": {
+        "document_type": "employment_appeal_tribunal_decision",
+        "slug_prefix": "/employment-appeal-tribunal-decisions",
+        "label": "Employment Appeal Tribunal",
+    },
+}
+
 _session = requests.Session()
 _session.headers["User-Agent"] = "ET-decisions-scraper/1.0 (research; dboland77@gmail.com)"
 
@@ -48,6 +62,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
             published_at    TEXT,
             indexed_at      TEXT NOT NULL,
             fetched_at      TEXT,
+            tribunal_type   TEXT,               -- 'et' or 'eat'
             decision_date   TEXT,
             country         TEXT,
             categories      TEXT,   -- JSON array e.g. ["unfair-dismissal"]
@@ -55,10 +70,16 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
             pdf_url         TEXT,
             content_id      TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_published  ON decisions(published_at);
+        CREATE INDEX IF NOT EXISTS idx_published     ON decisions(published_at);
         CREATE INDEX IF NOT EXISTS idx_decision_date ON decisions(decision_date);
-        CREATE INDEX IF NOT EXISTS idx_country     ON decisions(country);
+        CREATE INDEX IF NOT EXISTS idx_country       ON decisions(country);
     """)
+    # Migrate existing DBs that predate the tribunal_type column
+    try:
+        conn.execute("ALTER TABLE decisions ADD COLUMN tribunal_type TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_tribunal_type ON decisions(tribunal_type);")
     conn.commit()
     return conn
 
@@ -85,9 +106,9 @@ def _get(url: str, params: dict = None, retries: int = 3) -> dict:
             time.sleep(2 ** attempt)
 
 
-def search_page(start: int) -> dict:
+def search_page(start: int, document_type: str) -> dict:
     return _get(SEARCH_API, {
-        "filter_content_store_document_type": "employment_tribunal_decision",
+        "filter_content_store_document_type": document_type,
         "count": PAGE_SIZE,
         "start": start,
         "fields": "title,link,public_timestamp",
@@ -95,9 +116,9 @@ def search_page(start: int) -> dict:
     })
 
 
-def content_for_slug(slug: str) -> dict | None:
+def content_for_slug(slug: str, slug_prefix: str) -> dict | None:
     """Fetch full content from the GOV.UK Content API. Returns None if 404."""
-    path = slug if slug.startswith("/") else f"/employment-tribunal-decisions/{slug}"
+    path = slug if slug.startswith("/") else f"{slug_prefix}/{slug}"
     return _get(f"{CONTENT_API}{path}")
 
 
@@ -105,67 +126,82 @@ def content_for_slug(slug: str) -> dict | None:
 # Commands
 # ---------------------------------------------------------------------------
 
+def _resolve_tribunals(tribunal_arg: str) -> list[str]:
+    """Return list of tribunal keys from --tribunal argument."""
+    if tribunal_arg == "all":
+        return list(TRIBUNALS.keys())
+    if tribunal_arg not in TRIBUNALS:
+        sys.exit(f"Unknown tribunal type: {tribunal_arg!r}. Choose from: et, eat, all")
+    return [tribunal_arg]
+
+
 def cmd_sync(args):
     """Walk every search page and upsert slugs into the local index."""
     conn = open_db()
     now = datetime.now(timezone.utc).isoformat()
+    keys = _resolve_tribunals(args.tribunal)
 
-    first = search_page(0)
-    total = first["total"]
-    pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    print(f"Remote total: {total:,} decisions across {pages} pages")
+    for key in keys:
+        t = TRIBUNALS[key]
+        print(f"\n=== Syncing {t['label']} ({key}) ===")
 
-    inserted = updated = skipped = 0
+        first = search_page(0, t["document_type"])
+        total = first["total"]
+        pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        print(f"Remote total: {total:,} decisions across {pages} pages")
 
-    with tqdm(total=total, desc="Syncing index", unit="decisions") as bar:
-        for page_num in range(pages):
-            data = search_page(page_num * PAGE_SIZE)
-            results = data["results"]
+        inserted = updated = skipped = 0
 
-            rows_to_insert = []
-            rows_to_update = []
+        with tqdm(total=total, desc="Syncing index", unit="decisions") as bar:
+            for page_num in range(pages):
+                data = search_page(page_num * PAGE_SIZE, t["document_type"])
+                results = data["results"]
 
-            for r in results:
-                slug = r["link"]
-                title = r.get("title", "")
-                published_at = r.get("public_timestamp", "")
+                rows_to_insert = []
+                rows_to_update = []
 
-                existing = conn.execute(
-                    "SELECT published_at FROM decisions WHERE slug=?", (slug,)
-                ).fetchone()
+                for r in results:
+                    slug = r["link"]
+                    title = r.get("title", "")
+                    published_at = r.get("public_timestamp", "")
 
-                if existing is None:
-                    rows_to_insert.append((slug, title, published_at, now))
-                    inserted += 1
-                elif existing["published_at"] != published_at:
-                    # Decision was updated — clear fetched_at so content gets re-fetched
-                    rows_to_update.append((title, published_at, slug))
-                    updated += 1
-                else:
-                    skipped += 1
+                    existing = conn.execute(
+                        "SELECT published_at FROM decisions WHERE slug=?", (slug,)
+                    ).fetchone()
 
-            if rows_to_insert:
-                conn.executemany(
-                    "INSERT OR IGNORE INTO decisions (slug, title, published_at, indexed_at) VALUES (?,?,?,?)",
-                    rows_to_insert,
-                )
-            if rows_to_update:
-                conn.executemany(
-                    "UPDATE decisions SET title=?, published_at=?, fetched_at=NULL WHERE slug=?",
-                    rows_to_update,
-                )
-            conn.commit()
-            bar.update(len(results))
-            time.sleep(0.05)  # be gentle — ~20 req/s max
+                    if existing is None:
+                        rows_to_insert.append((slug, title, published_at, now, key))
+                        inserted += 1
+                    elif existing["published_at"] != published_at:
+                        rows_to_update.append((title, published_at, slug))
+                        updated += 1
+                    else:
+                        skipped += 1
 
-    print(f"\nSync done: {inserted:,} new  |  {updated:,} updated  |  {skipped:,} already current")
+                if rows_to_insert:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO decisions (slug, title, published_at, indexed_at, tribunal_type) VALUES (?,?,?,?,?)",
+                        rows_to_insert,
+                    )
+                if rows_to_update:
+                    conn.executemany(
+                        "UPDATE decisions SET title=?, published_at=?, fetched_at=NULL WHERE slug=?",
+                        rows_to_update,
+                    )
+                conn.commit()
+                bar.update(len(results))
+                time.sleep(0.05)  # be gentle — ~20 req/s max
+
+        print(f"Sync done: {inserted:,} new  |  {updated:,} updated  |  {skipped:,} already current")
+
     conn.close()
 
 
-def _fetch_and_store(slug: str, conn: sqlite3.Connection, lock: threading.Lock) -> str:
+def _fetch_and_store(slug: str, slug_prefix: str, tribunal_type: str,
+                     conn: sqlite3.Connection, lock: threading.Lock) -> str:
     """Fetch content for one slug and write to DB. Returns 'ok', 'missing', or 'error'."""
     try:
-        data = content_for_slug(slug)
+        data = content_for_slug(slug, slug_prefix)
         if data is None:
             return "missing"
 
@@ -179,6 +215,7 @@ def _fetch_and_store(slug: str, conn: sqlite3.Connection, lock: threading.Lock) 
 
         row = (
             datetime.now(timezone.utc).isoformat(),
+            tribunal_type,
             meta.get("tribunal_decision_decision_date"),
             meta.get("tribunal_decision_country"),
             json.dumps(meta.get("tribunal_decision_categories", [])),
@@ -191,7 +228,7 @@ def _fetch_and_store(slug: str, conn: sqlite3.Connection, lock: threading.Lock) 
         with lock:
             conn.execute(
                 """UPDATE decisions
-                   SET fetched_at=?, decision_date=?, country=?, categories=?,
+                   SET fetched_at=?, tribunal_type=?, decision_date=?, country=?, categories=?,
                        full_text=?, pdf_url=?, content_id=?
                    WHERE slug=?""",
                 row,
@@ -206,26 +243,34 @@ def cmd_fetch_all(args):
     """Fetch full content for every decision not yet fetched (or re-fetch all with --refetch)."""
     conn = open_db()
     lock = threading.Lock()
+    keys = _resolve_tribunals(args.tribunal)
 
-    query = "SELECT slug FROM decisions WHERE fetched_at IS NULL ORDER BY published_at DESC"
+    # Build slug-prefix lookup per slug using tribunal_type stored in DB
+    type_filter = f"AND tribunal_type IN ({','.join('?'*len(keys))})"
+    base_query = f"SELECT slug, tribunal_type FROM decisions WHERE fetched_at IS NULL {type_filter} ORDER BY published_at DESC"
     if args.refetch:
-        query = "SELECT slug FROM decisions ORDER BY published_at DESC"
+        base_query = f"SELECT slug, tribunal_type FROM decisions WHERE 1 {type_filter} ORDER BY published_at DESC"
 
-    slugs = [r["slug"] for r in conn.execute(query).fetchall()]
-    if not slugs:
+    rows = conn.execute(base_query, keys).fetchall()
+    if not rows:
         print("Nothing to fetch — all decisions already have full content.")
         conn.close()
         return
 
     workers = args.workers
-    print(f"Fetching full content for {len(slugs):,} decisions ({workers} parallel workers)…")
+    print(f"Fetching full content for {len(rows):,} decisions ({workers} parallel workers)…")
     print("This will take a while for the full dataset. Press Ctrl+C to stop; progress is saved.\n")
 
     ok = missing = errors = 0
 
+    def _task(row):
+        key = row["tribunal_type"] or "et"  # default for legacy rows without tribunal_type
+        prefix = TRIBUNALS.get(key, TRIBUNALS["et"])["slug_prefix"]
+        return _fetch_and_store(row["slug"], prefix, key, conn, lock)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_fetch_and_store, slug, conn, lock): slug for slug in slugs}
-        with tqdm(total=len(slugs), desc="Fetching content", unit="decisions") as bar:
+        futures = {pool.submit(_task, row): row["slug"] for row in rows}
+        with tqdm(total=len(rows), desc="Fetching content", unit="decisions") as bar:
             for future in as_completed(futures):
                 result = future.result()
                 if result == "ok":
@@ -245,25 +290,30 @@ def cmd_fetch(args):
     """Fetch full content for a single decision by slug."""
     conn = open_db()
     lock = threading.Lock()
+
+    key = args.tribunal
+    t = TRIBUNALS[key]
     slug = args.slug
     if not slug.startswith("/"):
-        slug = f"/employment-tribunal-decisions/{slug}"
+        slug = f"{t['slug_prefix']}/{slug}"
 
     # Ensure it's in the index
     existing = conn.execute("SELECT slug FROM decisions WHERE slug=?", (slug,)).fetchone()
     if existing is None:
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            "INSERT OR IGNORE INTO decisions (slug, indexed_at) VALUES (?,?)", (slug, now)
+            "INSERT OR IGNORE INTO decisions (slug, indexed_at, tribunal_type) VALUES (?,?,?)",
+            (slug, now, key),
         )
         conn.commit()
 
     print(f"Fetching: {slug}")
-    result = _fetch_and_store(slug, conn, lock)
+    result = _fetch_and_store(slug, t["slug_prefix"], key, conn, lock)
 
     if result == "ok":
         row = conn.execute("SELECT * FROM decisions WHERE slug=?", (slug,)).fetchone()
-        print(f"\nTitle:         {row['title']}")
+        print(f"\nTribunal:      {t['label']}")
+        print(f"Title:         {row['title']}")
         print(f"Decision date: {row['decision_date']}")
         print(f"Country:       {row['country']}")
         print(f"Categories:    {row['categories']}")
@@ -281,9 +331,18 @@ def cmd_fetch(args):
 
 def cmd_stats(args):
     conn = open_db()
-    total = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
-    fetched = conn.execute("SELECT COUNT(*) FROM decisions WHERE fetched_at IS NOT NULL").fetchone()[0]
-    has_text = conn.execute("SELECT COUNT(*) FROM decisions WHERE full_text IS NOT NULL").fetchone()[0]
+    keys = _resolve_tribunals(args.tribunal)
+    type_filter = f"AND tribunal_type IN ({','.join('?'*len(keys))})"
+
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM decisions WHERE 1 {type_filter}", keys
+    ).fetchone()[0]
+    fetched = conn.execute(
+        f"SELECT COUNT(*) FROM decisions WHERE fetched_at IS NOT NULL {type_filter}", keys
+    ).fetchone()[0]
+    has_text = conn.execute(
+        f"SELECT COUNT(*) FROM decisions WHERE full_text IS NOT NULL {type_filter}", keys
+    ).fetchone()[0]
 
     print(f"Decisions in index:         {total:>10,}")
     print(f"With full content fetched:  {fetched:>10,}")
@@ -292,18 +351,29 @@ def cmd_stats(args):
 
     if fetched > 0:
         print()
+        print("--- By tribunal type ---")
+        for row in conn.execute(
+            f"SELECT tribunal_type, COUNT(*) n FROM decisions WHERE fetched_at IS NOT NULL {type_filter} GROUP BY tribunal_type ORDER BY n DESC",
+            keys,
+        ):
+            label = TRIBUNALS.get(row["tribunal_type"] or "", {}).get("label", "unknown")
+            print(f"  {label:<30} {row['n']:>8,}")
+
+        print()
         print("--- By country ---")
         for row in conn.execute(
-            "SELECT country, COUNT(*) n FROM decisions WHERE fetched_at IS NOT NULL GROUP BY country ORDER BY n DESC"
+            f"SELECT country, COUNT(*) n FROM decisions WHERE fetched_at IS NOT NULL {type_filter} GROUP BY country ORDER BY n DESC",
+            keys,
         ):
-            print(f"  {(row['country'] or 'unknown'):<20} {row['n']:>8,}")
+            print(f"  {(row['country'] or 'unknown'):<30} {row['n']:>8,}")
 
         print()
         print("--- Decisions per year (decision date) ---")
         for row in conn.execute(
-            """SELECT substr(decision_date,1,4) yr, COUNT(*) n
-               FROM decisions WHERE decision_date IS NOT NULL
-               GROUP BY yr ORDER BY yr DESC LIMIT 15"""
+            f"""SELECT substr(decision_date,1,4) yr, COUNT(*) n
+               FROM decisions WHERE decision_date IS NOT NULL {type_filter}
+               GROUP BY yr ORDER BY yr DESC LIMIT 15""",
+            keys,
         ):
             print(f"  {row['yr']}  {row['n']:>8,}")
 
@@ -313,12 +383,15 @@ def cmd_stats(args):
 def cmd_export(args):
     conn = open_db()
     out_path = Path(args.output)
-    query = "SELECT * FROM decisions"
+    keys = _resolve_tribunals(args.tribunal)
+    type_filter = f"AND tribunal_type IN ({','.join('?'*len(keys))})"
+
+    query = f"SELECT * FROM decisions WHERE 1 {type_filter}"
     if args.fetched_only:
-        query += " WHERE fetched_at IS NOT NULL"
+        query += " AND fetched_at IS NOT NULL"
     query += " ORDER BY published_at DESC"
 
-    rows = conn.execute(query).fetchall()
+    rows = conn.execute(query, keys).fetchall()
     print(f"Exporting {len(rows):,} decisions to {out_path}…")
     with out_path.open("w", encoding="utf-8") as f:
         for row in rows:
@@ -337,26 +410,46 @@ def cmd_export(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Employment Tribunal Decisions scraper (GOV.UK)",
+        description="Employment Tribunal / Appeal Tribunal Decisions scraper (GOV.UK)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("sync", help="Sync the decision index from GOV.UK")
+    p_sync = sub.add_parser("sync", help="Sync the decision index from GOV.UK")
+    p_sync.add_argument(
+        "--tribunal", choices=["et", "eat", "all"], default="all",
+        help="Tribunal type to sync (default: all)",
+    )
 
     p_fa = sub.add_parser("fetch-all", help="Fetch full content for all indexed decisions")
     p_fa.add_argument("--workers", type=int, default=5, help="Parallel HTTP workers (default 5)")
     p_fa.add_argument("--refetch", action="store_true", help="Re-fetch even already-fetched decisions")
+    p_fa.add_argument(
+        "--tribunal", choices=["et", "eat", "all"], default="all",
+        help="Tribunal type to fetch (default: all)",
+    )
 
     p_f = sub.add_parser("fetch", help="Fetch full content for one decision")
-    p_f.add_argument("slug", help="Decision slug or full path, e.g. mr-smith-v-acme-1234/2024")
+    p_f.add_argument("slug", help="Decision slug or full path")
+    p_f.add_argument(
+        "--tribunal", choices=["et", "eat"], default="et",
+        help="Tribunal type for bare slugs (default: et)",
+    )
 
-    sub.add_parser("stats", help="Show DB statistics")
+    p_stats = sub.add_parser("stats", help="Show DB statistics")
+    p_stats.add_argument(
+        "--tribunal", choices=["et", "eat", "all"], default="all",
+        help="Tribunal type to show stats for (default: all)",
+    )
 
     p_ex = sub.add_parser("export", help="Export to newline-delimited JSON")
     p_ex.add_argument("--output", default="decisions.jsonl", help="Output file (default: decisions.jsonl)")
     p_ex.add_argument("--fetched-only", action="store_true", help="Only export decisions with full content")
+    p_ex.add_argument(
+        "--tribunal", choices=["et", "eat", "all"], default="all",
+        help="Tribunal type to export (default: all)",
+    )
 
     args = parser.parse_args()
     {
