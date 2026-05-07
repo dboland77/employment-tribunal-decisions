@@ -6,11 +6,13 @@ Commands:
   sync          Fetch all decision slugs from GOV.UK into the local DB index
   fetch-all     Fetch full content (text, metadata) for every indexed decision
   fetch <slug>  Fetch full content for a single decision
+  tag-outcomes  Analyse full text and set claimant/respondent won/appealed flags
   stats         Show database statistics
   export        Export DB to newline-delimited JSON (decisions.jsonl)
 """
 import argparse
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -26,7 +28,7 @@ BASE_URL = "https://www.gov.uk"
 SEARCH_API = f"{BASE_URL}/api/search.json"
 CONTENT_API = f"{BASE_URL}/api/content"
 PAGE_SIZE = 1000
-DB_PATH = Path("decisions.db")
+DB_PATH = Path("/mnt/data/decisions.db")
 
 # Supported tribunal types
 TRIBUNALS = {
@@ -80,6 +82,15 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # column already exists
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_tribunal_type ON decisions(tribunal_type);")
+    # Backfill tribunal_type for rows synced before this column existed
+    conn.execute("UPDATE decisions SET tribunal_type='et' WHERE tribunal_type IS NULL AND slug LIKE '/employment-tribunal-decisions/%'")
+    conn.execute("UPDATE decisions SET tribunal_type='eat' WHERE tribunal_type IS NULL AND slug LIKE '/employment-appeal-tribunal-decisions/%'")
+    # Migrate: add outcome/appeal flag columns
+    for col in ("claimant_appealed", "respondent_appealed", "claimant_won", "respondent_won"):
+        try:
+            conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} INTEGER")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -329,6 +340,164 @@ def cmd_fetch(args):
     conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Outcome flag detection
+# ---------------------------------------------------------------------------
+
+# ET: claimant won at least one claim
+_ET_CLAIMANT_WIN = re.compile(
+    r'(?i)(?:'
+    r'(?:is|are)\s+well[- ]?founded'
+    r'|ordered\s+to\s+pay'
+    r'|(?:claim|complaint)s?\s+(?:(?:in|of)\s+\w+(?:\s+\w+){0,4}\s+)?succeed'
+    r'|finds?\s+(?:in\s+)?favour\s+of\s+(?:the\s+)?claimant'
+    r'|claimant\s+(?:is\s+)?entitled\s+to\s+(?:compensation|damages|remedy|award)'
+    r')'
+)
+
+# ET: respondent won at least one claim (or struck out / no jurisdiction)
+_ET_RESPONDENT_WIN = re.compile(
+    r'(?i)(?:'
+    r'not\s+well[- ]?founded'
+    r'|(?:claim|complaint|action)s?\s+(?:is|are)\s+(?:therefore\s+|accordingly\s+|hereby\s+)?dismissed'
+    r'|judgment\s+(?:is\s+)?(?:to\s+)?dismiss(?:ed)?\s+(?:the\s+)?claim'
+    r'|struck\s+out'
+    r'|does\s+not\s+succeed\s+and\s+(?:is\s+)?dismissed'
+    r')'
+)
+
+# Withdrawal — exclude from outcome detection
+_WITHDRAWAL = re.compile(r'(?i)dismissed\s+(?:following|on|after|upon)\s+(?:a\s+)?withdrawal')
+
+# EAT: who brought the appeal
+_EAT_CLAIMANT_APPEALED = re.compile(
+    r"(?i)(?:"
+    r"claimant['’]?s?\s+appeal"
+    r"|claimant\s+(?:has\s+)?appeal"
+    r"|appeal\s+(?:by|of|from)\s+(?:the\s+)?claimant"
+    r"|employee['’]?s?\s+appeal"
+    r"|claimant[,\s]\s*appellant"
+    r"|appellant[,\s]\s*claimant"
+    r")"
+)
+
+_EAT_RESPONDENT_APPEALED = re.compile(
+    r"(?i)(?:"
+    r"respondent['’]?s?\s+appeal"
+    r"|respondent\s+(?:has\s+)?appeal"
+    r"|appeal\s+(?:by|of|from)\s+(?:the\s+)?respondent"
+    r"|employer['’]?s?\s+appeal"
+    r"|respondent[,\s]\s*appellant"
+    r"|appellant[,\s]\s*respondent"
+    r")"
+)
+
+# EAT: outcome of the appeal
+_EAT_ALLOWED = re.compile(
+    r'(?i)(?:'
+    r'\bheld\s*[:\-]\s*allowing\b'
+    r'|\ballow(?:ing|ed)\s+the\s+appeal\b'
+    r'|\bappeal\s+(?:is\s+|was\s+)?allow(?:ed|s)\b'
+    r')'
+)
+
+_EAT_DISMISSED = re.compile(
+    r'(?i)(?:'
+    r'\bheld\s*[:\-]\s*dismissing\b'
+    r'|\bdismiss(?:ing|ed)\s+the\s+appeal\b'
+    r'|\bappeal\s+(?:is\s+|was\s+)?dismiss(?:ed|es)\b'
+    r'|\bappeal\s+(?:is\s+)?rejected\b'
+    r'|\beat\s+(?:rejected|dismissed)\s+(?:the\s+)?appeal\b'
+    r')'
+)
+
+
+def _detect_outcome_flags(tribunal_type: str, full_text: str) -> dict:
+    """Return dict of claimant_appealed, respondent_appealed, claimant_won, respondent_won (each 0/1/None)."""
+    flags = dict(claimant_appealed=None, respondent_appealed=None,
+                 claimant_won=None, respondent_won=None)
+    if not full_text:
+        return flags
+
+    head = full_text[:8000]
+
+    if tribunal_type == 'eat':
+        ca = bool(_EAT_CLAIMANT_APPEALED.search(head))
+        ra = bool(_EAT_RESPONDENT_APPEALED.search(head))
+        flags['claimant_appealed'] = int(ca)
+        flags['respondent_appealed'] = int(ra)
+
+        allowed   = bool(_EAT_ALLOWED.search(head))
+        dismissed = bool(_EAT_DISMISSED.search(head))
+
+        # Derive won/lost only for unambiguous single-side appeals
+        if allowed and not dismissed:
+            if ca and not ra:
+                flags['claimant_won'] = 1; flags['respondent_won'] = 0
+            elif ra and not ca:
+                flags['respondent_won'] = 1; flags['claimant_won'] = 0
+        elif dismissed and not allowed:
+            if ca and not ra:
+                flags['claimant_won'] = 0; flags['respondent_won'] = 1
+            elif ra and not ca:
+                flags['respondent_won'] = 0; flags['claimant_won'] = 1
+
+    else:  # ET
+        flags['claimant_appealed'] = None
+        flags['respondent_appealed'] = None
+
+        # Strip withdrawal sentences so they don't trigger outcome flags
+        txt = _WITHDRAWAL.sub('', head)
+
+        flags['claimant_won']   = int(bool(_ET_CLAIMANT_WIN.search(txt)))
+        flags['respondent_won'] = int(bool(_ET_RESPONDENT_WIN.search(txt)))
+
+    return flags
+
+
+def cmd_tag_outcomes(args):
+    """Analyse full_text for every fetched decision and write outcome/appeal flags."""
+    conn = open_db()
+
+    rows = conn.execute(
+        "SELECT rowid, tribunal_type, full_text FROM decisions WHERE full_text IS NOT NULL"
+    ).fetchall()
+
+    if not rows:
+        print("No decisions with full text found.")
+        conn.close()
+        return
+
+    print(f"Tagging outcomes for {len(rows):,} decisions…")
+
+    updated = 0
+    for row in tqdm(rows, unit="decisions"):
+        flags = _detect_outcome_flags(row['tribunal_type'], row['full_text'])
+        conn.execute(
+            """UPDATE decisions
+               SET claimant_appealed=?, respondent_appealed=?,
+                   claimant_won=?, respondent_won=?
+               WHERE rowid=?""",
+            (flags['claimant_appealed'], flags['respondent_appealed'],
+             flags['claimant_won'], flags['respondent_won'],
+             row['rowid']),
+        )
+        updated += 1
+        if updated % 5000 == 0:
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+
+    # Print summary stats
+    conn2 = open_db()
+    for col in ('claimant_won', 'respondent_won', 'claimant_appealed', 'respondent_appealed'):
+        n = conn2.execute(f"SELECT COUNT(*) FROM decisions WHERE {col}=1").fetchone()[0]
+        print(f"  {col}=1 : {n:,}")
+    conn2.close()
+    print("Done.")
+
+
 def cmd_stats(args):
     conn = open_db()
     keys = _resolve_tribunals(args.tribunal)
@@ -443,6 +612,8 @@ def main():
         help="Tribunal type to show stats for (default: all)",
     )
 
+    sub.add_parser("tag-outcomes", help="Detect and tag claimant/respondent won/appealed flags")
+
     p_ex = sub.add_parser("export", help="Export to newline-delimited JSON")
     p_ex.add_argument("--output", default="decisions.jsonl", help="Output file (default: decisions.jsonl)")
     p_ex.add_argument("--fetched-only", action="store_true", help="Only export decisions with full content")
@@ -456,6 +627,7 @@ def main():
         "sync": cmd_sync,
         "fetch-all": cmd_fetch_all,
         "fetch": cmd_fetch,
+        "tag-outcomes": cmd_tag_outcomes,
         "stats": cmd_stats,
         "export": cmd_export,
     }[args.command](args)
