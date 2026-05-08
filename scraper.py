@@ -70,7 +70,8 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
             categories      TEXT,   -- JSON array e.g. ["unfair-dismissal"]
             full_text       TEXT,
             pdf_url         TEXT,
-            content_id      TEXT
+            content_id      TEXT,
+            neutral_citation TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_published     ON decisions(published_at);
         CREATE INDEX IF NOT EXISTS idx_decision_date ON decisions(decision_date);
@@ -91,6 +92,10 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} INTEGER")
         except sqlite3.OperationalError:
             pass
+    try:
+        conn.execute("ALTER TABLE decisions ADD COLUMN neutral_citation TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     return conn
 
@@ -115,6 +120,7 @@ def _get(url: str, params: dict = None, retries: int = 3) -> dict:
             if attempt == retries - 1:
                 raise
             time.sleep(2 ** attempt)
+
 
 
 def search_page(start: int, document_type: str) -> dict:
@@ -142,8 +148,10 @@ def _resolve_tribunals(tribunal_arg: str) -> list[str]:
     if tribunal_arg == "all":
         return list(TRIBUNALS.keys())
     if tribunal_arg not in TRIBUNALS:
-        sys.exit(f"Unknown tribunal type: {tribunal_arg!r}. Choose from: et, eat, all")
+        valid = ', '.join(list(TRIBUNALS.keys()) + ['all'])
+        sys.exit(f"Unknown tribunal type: {tribunal_arg!r}. Choose from: {valid}")
     return [tribunal_arg]
+
 
 
 def cmd_sync(args):
@@ -306,7 +314,7 @@ def cmd_fetch(args):
     t = TRIBUNALS[key]
     slug = args.slug
     if not slug.startswith("/"):
-        slug = f"{t['slug_prefix']}/{slug}"
+        slug = f"{t['slug_prefix']}/{slug}" if t['slug_prefix'] else f"/{slug}"
 
     # Ensure it's in the index
     existing = conn.execute("SELECT slug FROM decisions WHERE slug=?", (slug,)).fetchone()
@@ -328,6 +336,8 @@ def cmd_fetch(args):
         print(f"Decision date: {row['decision_date']}")
         print(f"Country:       {row['country']}")
         print(f"Categories:    {row['categories']}")
+        if row['neutral_citation']:
+            print(f"Citation:      {row['neutral_citation']}")
         print(f"PDF URL:       {row['pdf_url']}")
         text_len = len(row["full_text"] or "")
         print(f"Full text:     {text_len:,} characters")
@@ -421,7 +431,7 @@ def _detect_outcome_flags(tribunal_type: str, full_text: str) -> dict:
 
     head = full_text[:8000]
 
-    if tribunal_type == 'eat':
+    if tribunal_type in ('eat', 'ca'):
         ca = bool(_EAT_CLAIMANT_APPEALED.search(head))
         ra = bool(_EAT_RESPONDENT_APPEALED.search(head))
         flags['claimant_appealed'] = int(ca)
